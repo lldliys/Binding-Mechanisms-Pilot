@@ -102,8 +102,10 @@ class Runner:
         self.lm = None
         if prefer_nnsight:
             try:
+                import nnsight
                 from nnsight import LanguageModel
 
+                print(f"nnsight {getattr(nnsight, '__version__', 'unknown')}")
                 self.lm = LanguageModel(
                     model_name, device_map=device, torch_dtype=torch_dtype, dispatch=True
                 )
@@ -127,22 +129,53 @@ class Runner:
         self.blocks = self.hf.model.layers
         self.n_layers = len(self.blocks)
 
+        if self.lm is not None:
+            self._verify_nnsight()
+
+    def _verify_nnsight(self, probe="The capital of France is", tol=1e-2):
+        """Check the nnsight path against forward hooks, and fall back if it differs.
+
+        The two backends compute the same forward pass, so any real disagreement
+        means one of them is not doing what it claims.
+        """
+        try:
+            a, _ = self._run_nnsight(probe, None, False)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[warn] nnsight path unusable ({exc}); using hooks")
+            self.lm = None
+            return
+        b, _ = self._run_hooks(probe, None, False)
+        delta = float((a - b).abs().max())
+        if delta > tol:
+            print(f"[warn] nnsight and hooks disagree (max|delta|={delta:.3g}); using hooks")
+            self.lm = None
+        else:
+            print(f"nnsight verified against hooks, max|delta|={delta:.3g}")
+
     # -- backends ---------------------------------------------------------
 
     def _run_nnsight(self, prompt, patch, save_resid):
+        # Some nnsight versions execute the trace body in their own frame, so
+        # names bound inside it are not visible here afterwards. Collect results
+        # by mutating containers created before the block instead.
+        saved, box = {}, {}
         with self.lm.trace(prompt):
             if patch is not None:
                 layer, pos, vec = patch
                 self.lm.model.layers[layer].output[0][0, pos, :] = vec.to(
                     self.device, self.dtype
                 )
-            saved = {}
             if save_resid:
                 for i in range(self.n_layers):
                     saved[i] = self.lm.model.layers[i].output[0][0, -1, :].save()
-            logits = self.lm.output.logits[0, -1, :].save()
+            box["logits"] = self.lm.output.logits[0, -1, :].save()
+
+        if "logits" not in box:
+            raise RuntimeError(
+                "the nnsight trace body did not run in this frame; use backend='hooks'"
+            )
         resid = {i: _val(v).detach().float().cpu() for i, v in saved.items()}
-        return _val(logits).detach().float().cpu(), resid
+        return _val(box["logits"]).detach().float().cpu(), resid
 
     def _run_hooks(self, prompt, patch, save_resid):
         ids = self.tok(prompt, return_tensors="pt").to(self.device)
