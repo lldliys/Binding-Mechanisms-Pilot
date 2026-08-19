@@ -129,28 +129,56 @@ class Runner:
         self.blocks = self.hf.model.layers
         self.n_layers = len(self.blocks)
 
+        # Recent transformers versions return the hidden states from a decoder
+        # layer directly; older ones return a tuple. Indexing has to follow.
+        self.block_tuple = self._detect_block_output()
+        print(f"decoder layer returns {'a tuple' if self.block_tuple else 'a bare tensor'}")
+
         if self.lm is not None:
             self._verify_nnsight()
+
+    def _detect_block_output(self):
+        seen = {}
+
+        def hook(_module, _inp, out):
+            seen["tuple"] = isinstance(out, (tuple, list))
+
+        handle = self.blocks[0].register_forward_hook(hook)
+        try:
+            with torch.no_grad():
+                self.hf(**self.tok("probe", return_tensors="pt").to(self.device))
+        finally:
+            handle.remove()
+        return seen.get("tuple", True)
 
     def _verify_nnsight(self, probe="The capital of France is", tol=1e-2):
         """Check the nnsight path against forward hooks, and fall back if it differs.
 
-        The two backends compute the same forward pass, so any real disagreement
-        means one of them is not doing what it claims.
+        Both backends compute the same forward pass, so a real disagreement means
+        one of them is not doing what it claims. This exercises reading residuals
+        and patching, not just a plain forward, since those are the paths the
+        experiment actually uses.
         """
+        mid = self.n_layers // 2
         try:
-            a, _ = self._run_nnsight(probe, None, False)
+            a, resid = self._run_nnsight(probe, None, True)
+            a_patched, _ = self._run_nnsight(probe, (mid, -1, resid[mid]), False)
         except Exception as exc:  # noqa: BLE001
             print(f"[warn] nnsight path unusable ({exc}); using hooks")
             self.lm = None
             return
-        b, _ = self._run_hooks(probe, None, False)
-        delta = float((a - b).abs().max())
+
+        b, resid_h = self._run_hooks(probe, None, True)
+        b_patched, _ = self._run_hooks(probe, (mid, -1, resid_h[mid]), False)
+        delta = max(float((a - b).abs().max()),
+                    float((resid[mid] - resid_h[mid]).abs().max()),
+                    float((a_patched - b_patched).abs().max()))
         if delta > tol:
             print(f"[warn] nnsight and hooks disagree (max|delta|={delta:.3g}); using hooks")
             self.lm = None
         else:
-            print(f"nnsight verified against hooks, max|delta|={delta:.3g}")
+            print(f"nnsight verified against hooks (logits, residuals, patch), "
+                  f"max|delta|={delta:.3g}")
 
     # -- backends ---------------------------------------------------------
 
@@ -159,15 +187,22 @@ class Runner:
         # names bound inside it are not visible here afterwards. Collect results
         # by mutating containers created before the block instead.
         saved, box = {}, {}
+        layer, pos, value = patch if patch is not None else (None, None, None)
+        if value is not None:
+            value = value.to(self.device, self.dtype)
+
         with self.lm.trace(prompt):
-            if patch is not None:
-                layer, pos, vec = patch
-                self.lm.model.layers[layer].output[0][0, pos, :] = vec.to(
-                    self.device, self.dtype
-                )
+            if layer is not None:
+                if self.block_tuple:
+                    self.lm.model.layers[layer].output[0][0, pos, :] = value
+                else:
+                    self.lm.model.layers[layer].output[0, pos, :] = value
             if save_resid:
                 for i in range(self.n_layers):
-                    saved[i] = self.lm.model.layers[i].output[0][0, -1, :].save()
+                    if self.block_tuple:
+                        saved[i] = self.lm.model.layers[i].output[0][0, -1, :].save()
+                    else:
+                        saved[i] = self.lm.model.layers[i].output[0, -1, :].save()
             box["logits"] = self.lm.output.logits[0, -1, :].save()
 
         if "logits" not in box:
