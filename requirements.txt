@@ -1,0 +1,7 @@
+torch>=2.2
+transformers>=4.44
+accelerate>=0.33
+nnsight>=0.4
+pandas>=2.0
+matplotlib>=3.7
+pytest>=8.0
